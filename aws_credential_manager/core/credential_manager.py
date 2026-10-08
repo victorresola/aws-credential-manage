@@ -9,6 +9,7 @@ from ..integrations.onepassword import OnePasswordClient
 from ..utils.config import (
     DEFAULT_ACCESS_KEY_MAX_AGE,
     DEFAULT_PASSWORD_MAX_AGE,
+    DEFAULT_VAULT,
     ConfigManager,
 )
 from .access_key_manager import AccessKeyManager
@@ -18,7 +19,7 @@ from .password_manager import PasswordManager
 class CredentialManager:
     """Top-level orchestrator for all credential operations."""
 
-    def __init__(self, credentials_path: str | None = None, vault_name: str = "AWS"):
+    def __init__(self, credentials_path: str | None = None, vault_name: str = DEFAULT_VAULT):
         self.config = ConfigManager(credentials_path, vault_name)
         self.aws = AWSClient()
         self.op = OnePasswordClient(vault_name)
@@ -40,7 +41,7 @@ class CredentialManager:
             print(f"     1Password: {profile_name}")
             print()
 
-    def import_credentials(self, profile_name: str | None = None, dry_run: bool = False) -> bool:
+    def import_credentials(self, profile_name: str | None = None, dry_run: bool = False) -> bool:        
         """Import AWS access keys from credentials file to 1Password items."""
         profiles = self.config.get_aws_profiles()
 
@@ -56,7 +57,7 @@ class CredentialManager:
             print("✗ No profiles to import")
             return False
 
-        print(f"Importing AWS credentials for {len(target_profiles)} profiles to 1Password...")
+        print(f"Importing AWS credentials for {len(target_profiles)} profiles to 1Password...")        
 
         success_count = 0
         for profile in target_profiles:
@@ -72,9 +73,10 @@ class CredentialManager:
                 continue
 
             try:
-                item_data = self.op.get_item(pname)
+                item_title = self.get_item_title(pname)
+                item_data = self.op.get_item(item_title)
                 if not item_data:
-                    print(f"✗ 1Password item not found: {pname}")
+                    print(f"✗ 1Password item not found: {item_title}")
                     continue
 
                 has_access_key = (
@@ -85,7 +87,7 @@ class CredentialManager:
                     is not None
                 )
 
-                self.op.edit_item(pname,
+                self.op.edit_item(item_title,
                                   **{
                                       'aws_access_key_id[text]':
                                           profile['access_key_id'],
@@ -96,17 +98,111 @@ class CredentialManager:
                                   })
 
                 action = "Updated" if (has_access_key or has_secret_key) else "Added"
-                print(f"✓ {action} AWS credentials in 1Password: {pname}")
+                print(f"✓ {action} AWS credentials in 1Password: {pname} - item title: {item_title}")
                 success_count += 1
 
             except Exception as e:
-                print(f"✗ Failed to import credentials for {pname}: {e}")
+                print(f"✗ Failed to import credentials for {pname} (item title: {item_title}): {e}")
 
         print(
             f"\n📊 Summary: {success_count}/{len(target_profiles)} profiles "
             "imported successfully"
         )
         return success_count == len(target_profiles)
+
+    def batch_update(
+        self,
+        operation: str,
+        excluded_profiles: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> bool:
+        """Run password and/or access-key maintenance for selected profiles."""
+        valid_operations = {"password", "access-key", "both"}
+        if operation not in valid_operations:
+            print(
+                f"✗ Invalid batch operation '{operation}'. "
+                "Choose password, access-key, or both."
+            )
+            return False
+
+        profiles = self.config.get_aws_profiles()
+        profile_names = [profile["name"] for profile in profiles]
+        excluded = list(dict.fromkeys(excluded_profiles or []))
+        unknown_exclusions = [name for name in excluded if name not in profile_names]
+        if unknown_exclusions:
+            print(
+                "✗ Unknown profile exclusion(s): "
+                + ", ".join(unknown_exclusions)
+            )
+            return False
+
+        excluded_set = set(excluded)
+        candidate_names = [name for name in profile_names if name not in excluded_set]
+        if not candidate_names:
+            print("✗ No profiles remain after applying exclusions")
+            return False
+
+        # Profiles with no 1Password item are skipped rather than attempted.
+        # An unmapped profile is typically an alias of a mapped one (e.g. the
+        # 'default' section), so operating on it would rotate the same IAM user
+        # twice and strand credentials the alias still points at.
+        mappings = self.config.load_profile_mappings()
+        if mappings is None:
+            print("✗ Cannot read the profile mapping file; refusing to run a batch")
+            return False
+
+        selected_names = [name for name in candidate_names if name in mappings]
+        unmapped_names = [name for name in candidate_names if name not in mappings]
+        if not selected_names:
+            print("✗ No selected profile has a 1Password mapping")
+            return False
+
+        operations = [operation] if operation != "both" else ["password", "access-key"]
+        total_operations = len(selected_names) * len(operations)
+        successful_operations = 0
+        failed_profiles: list[str] = []
+
+        print(
+            f"🔄 Running batch '{operation}' for {len(selected_names)} profile(s)"
+        )
+        if excluded:
+            print(f"Excluded profiles: {', '.join(excluded)}")
+        if unmapped_names:
+            print(
+                f"Skipped (no 1Password mapping): {', '.join(unmapped_names)}"
+            )
+        if dry_run:
+            print("[DRY RUN] No changes will be made")
+
+        for profile_name in selected_names:
+            profile_succeeded = True
+            print(f"\n📍 Processing {profile_name}")
+            for current_operation in operations:
+                try:
+                    if current_operation == "password":
+                        succeeded = self.passwords.update_profile(profile_name, dry_run)
+                    else:
+                        succeeded = self.access_keys.refresh_key(profile_name, dry_run)
+                except Exception as error:
+                    print(f"✗ {current_operation} failed for {profile_name}: {error}")
+                    succeeded = False
+
+                if succeeded:
+                    successful_operations += 1
+                else:
+                    profile_succeeded = False
+                    if current_operation == "password" and operation == "both":
+                        break
+
+            if not profile_succeeded:
+                failed_profiles.append(profile_name)
+
+        print("\n📊 Batch summary")
+        print(f"  Successful operations: {successful_operations}/{total_operations}")
+        print(f"  Profiles failed: {len(failed_profiles)}/{len(selected_names)}")
+        if failed_profiles:
+            print(f"  Failed profiles: {', '.join(failed_profiles)}")
+        return not failed_profiles
 
     def quarterly_update(self, password_max_age: int | None = None,
                           access_key_max_age: int | None = None,

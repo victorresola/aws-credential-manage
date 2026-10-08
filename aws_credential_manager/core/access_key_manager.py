@@ -9,6 +9,7 @@ from datetime import datetime
 from ..integrations.aws_client import AWSClient
 from ..integrations.onepassword import OnePasswordClient
 from ..utils.config import DEFAULT_ACCESS_KEY_MAX_AGE, ConfigManager
+from .password_manager import PasswordManager
 
 
 class AccessKeyManager:
@@ -18,6 +19,7 @@ class AccessKeyManager:
         self.aws = aws
         self.op = op
         self.config = config
+        self.passwords = PasswordManager(aws, op, config)
 
     def get_access_key_age(self, profile_name: str) -> dict | None:
         """Get access key age from AWS API."""
@@ -133,14 +135,14 @@ class AccessKeyManager:
             )
             return False
 
-    def _test_new_credentials(self, profile_name: str, max_retries: int = 5,
-                               initial_delay: int = 2) -> bool:
+    def _test_new_credentials(self, profile_name: str, credentials: dict[str, str],
+                              max_retries: int = 5, initial_delay: int = 2) -> bool:
         """Test new credentials with exponential backoff retry."""
         print(f"🔄 Testing new credentials for {profile_name}...")
 
         for attempt in range(max_retries):
             try:
-                self.aws.get_user(profile_name)
+                self.aws.get_user_with_credentials(credentials)
                 print(f"✓ New credentials for {profile_name} are working")
                 return True
             except subprocess.CalledProcessError as e:
@@ -178,7 +180,20 @@ class AccessKeyManager:
 
         return False
 
-    def refresh_key(self, profile_name: str, dry_run: bool = False) -> bool:
+    @staticmethod
+    def _describe_aws_error(error: Exception) -> str:
+        """Return AWS CLI stderr without leaking command-line MFA codes."""
+        if not isinstance(error, subprocess.CalledProcessError):
+            return str(error)
+        detail = error.stderr
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", "replace")
+        detail = (detail or "").strip()
+        return detail or f"AWS CLI exited with status {error.returncode}"
+
+    def refresh_key(
+        self, profile_name: str, dry_run: bool = False,
+    ) -> bool:
         """Refresh (recreate) AWS access key for a profile with rollback support."""
         credentials_path = self.config.credentials_path
 
@@ -223,12 +238,37 @@ class AccessKeyManager:
                 print("  Please delete an existing key before creating a new one")
                 return False
 
-            # Step 2: Create new access key
-            new_key = self.aws.create_access_key(profile_name, username)
+            try:
+                mfa_serial_number = self.aws.get_mfa_serial_number(
+                    profile_name, username
+                )
+                item_title = self.passwords.get_item_title(profile_name)
+                mfa_code = self.op.get_one_time_password(item_title)
+            except (subprocess.CalledProcessError, ValueError) as error:
+                print(f"✗ Unable to resolve MFA device: {self._describe_aws_error(error)}")
+                return False
+            except Exception as error:
+                print(f"✗ Unable to retrieve MFA code from 1Password: {error}")
+                return False
+
+            if not (len(mfa_code) == 6 and mfa_code.isdecimal()):
+                print("✗ 1Password returned an invalid MFA code")
+                return False
+            mfa_session = self.aws.get_mfa_session(
+                profile_name, mfa_serial_number, mfa_code
+            )
+
+            # Step 2: Create new access key through the MFA-backed session.
+            new_key = self.aws.create_access_key(
+                profile_name, username, mfa_session
+            )
             print(f"✓ Created new access key for user: {username}")
             print(f"  New Access Key ID: {new_key['AccessKeyId']}")
         except subprocess.CalledProcessError as e:
-            print(f"✗ Failed to create new access key for {profile_name}: {e}")
+            print(
+                f"✗ Failed to create new access key for {profile_name}: "
+                f"{self._describe_aws_error(e)}"
+            )
             return False
 
         old_access_key_id = current_keys[0]['AccessKeyId'] if current_keys else None
@@ -240,7 +280,7 @@ class AccessKeyManager:
             print("✗ Failed to update credentials file, cleaning up...")
             try:
                 self.aws.delete_access_key(
-                    profile_name, username, new_key['AccessKeyId']
+                    profile_name, username, new_key['AccessKeyId'], mfa_session
                 )
             except Exception:  # noqa: S110 - cleanup best-effort during rollback
                 pass
@@ -251,15 +291,13 @@ class AccessKeyManager:
         time.sleep(3)
 
         # Step 5: Test new credentials
-        if not self._test_new_credentials(profile_name):
+        if not self._test_new_credentials(profile_name, new_key):
             print("✗ New credentials failed testing, rolling back...")
             print(f"  Deleting newly created access key: {new_key['AccessKeyId']}")
             try:
-                subprocess.run([
-                    'aws', 'iam', 'delete-access-key',
-                    '--user-name', username,
-                    '--access-key-id', new_key['AccessKeyId']
-                ], capture_output=True, text=True, check=True)
+                self.aws.delete_access_key(
+                    profile_name, username, new_key['AccessKeyId'], mfa_session
+                )
                 print(f"  ✓ Deleted failed access key: {new_key['AccessKeyId']}")
             except (subprocess.CalledProcessError, Exception) as e:
                 print(f"  ⚠️ Could not delete failed access key {new_key['AccessKeyId']}: {e}")
@@ -274,19 +312,22 @@ class AccessKeyManager:
 
         # Step 6: Record metadata in 1Password
         try:
-            self.op.edit_item(profile_name,
+            item_title = self.passwords.get_item_title(profile_name)
+            self.op.edit_item(item_title,
                               **{
                                   'last_access_key_refresh[text]': datetime.now().isoformat(),
                                   'current_access_key_id[text]': new_key['AccessKeyId']
                               })
-            print(f"✓ Updated 1Password metadata for: {profile_name}")
+            print(f"✓ Updated 1Password metadata for: {profile_name} with item title: {item_title}")
         except subprocess.CalledProcessError:
             print("⚠️ Failed to update 1Password metadata, but access key refresh succeeded")
 
         # Step 7: Delete old access key
         if old_access_key_id:
             try:
-                self.aws.delete_access_key(profile_name, username, old_access_key_id)
+                self.aws.delete_access_key(
+                    profile_name, username, old_access_key_id, mfa_session
+                )
                 print(f"✓ Deleted old access key: {old_access_key_id}")
             except Exception:
                 print(f"⚠️ Failed to delete old access key: {old_access_key_id}")

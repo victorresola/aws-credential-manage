@@ -28,16 +28,29 @@ class TestGetUser:
         assert "--profile" in args and "dev" in args
 
 
-class TestUpdateLoginProfile:
+class TestChangePassword:
     def test_builds_command(self, client, mocker):
         run = mocker.patch(MODULE).run
         run.return_value = FakeCompletedProcess()
-        client.update_login_profile("dev", "bob", "pw123")
+        client.change_password("dev", "old-pw", "new-pw")
         args = run.call_args.args[0]
-        assert args[:3] == ["aws", "iam", "update-login-profile"]
-        assert "--user-name" in args and "bob" in args
-        assert "--password" in args and "pw123" in args
-        assert "--no-password-reset-required" in args
+        assert args[:3] == ["aws", "iam", "change-password"]
+        assert "--old-password=old-pw" in args
+        assert "--new-password=new-pw" in args
+        assert "--user-name" not in args
+
+    def test_passwords_starting_with_hyphens_are_not_parsed_as_options(
+        self, client, mocker
+    ):
+        """Bare password values beginning with '-' make the AWS CLI reject them."""
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess()
+        client.change_password("dev", "-old-pw", "-new-pw")
+        args = run.call_args.args[0]
+        assert "--old-password=-old-pw" in args
+        assert "--new-password=-new-pw" in args
+        assert "-old-pw" not in args
+        assert "-new-pw" not in args
 
 
 class TestListAccessKeys:
@@ -56,6 +69,72 @@ class TestCreateAccessKey:
             stdout=json.dumps({"AccessKey": key})
         )
         assert client.create_access_key("dev", "bob") == key
+
+    def test_uses_mfa_session_credentials_when_provided(self, client, mocker):
+        key = {"AccessKeyId": "AKIANEW", "SecretAccessKey": "shh"}
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess(stdout=json.dumps({"AccessKey": key}))
+
+        client.create_access_key(
+            "dev", "bob",
+            {"AccessKeyId": "ASIASESSION", "SecretAccessKey": "session-secret",
+             "SessionToken": "session-token"},
+        )
+
+        environment = run.call_args.kwargs["env"]
+        assert "--profile" not in run.call_args.args[0]
+        assert environment["AWS_ACCESS_KEY_ID"] == "ASIASESSION"
+        assert environment["AWS_SECRET_ACCESS_KEY"] == "session-secret"
+        assert environment["AWS_SESSION_TOKEN"] == "session-token"
+
+
+class TestMfaSession:
+    def test_requests_an_sts_session_with_mfa(self, client, mocker):
+        credentials = {
+            "AccessKeyId": "ASIASESSION", "SecretAccessKey": "session-secret",
+            "SessionToken": "session-token",
+        }
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess(
+            stdout=json.dumps({"Credentials": credentials})
+        )
+
+        assert client.get_mfa_session("dev", "arn:aws:iam::123:mfa/bob", "123456") == credentials
+        args = run.call_args.args[0]
+        assert args[:4] == ["aws", "sts", "get-session-token", "--profile"]
+        assert "arn:aws:iam::123:mfa/bob" in args
+        assert "123456" in args
+
+    def test_gets_the_only_configured_mfa_device(self, client, mocker):
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess(stdout=json.dumps({
+            "MFADevices": [{"SerialNumber": "arn:aws:iam::123:mfa/bob"}],
+        }))
+
+        assert client.get_mfa_serial_number("dev", "bob") == "arn:aws:iam::123:mfa/bob"
+
+    def test_rejects_missing_or_ambiguous_mfa_devices(self, client, mocker):
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess(stdout=json.dumps({"MFADevices": []}))
+
+        with pytest.raises(ValueError, match="exactly one MFA device"):
+            client.get_mfa_serial_number("dev", "bob")
+
+
+class TestGetUserWithCredentials:
+    def test_uses_only_explicit_credentials(self, client, mocker, monkeypatch):
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "wrong-session")
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess(
+            stdout=json.dumps({"User": {"UserName": "bob"}})
+        )
+
+        assert client.get_user_with_credentials(
+            {"AccessKeyId": "AKIANEW", "SecretAccessKey": "new-secret"}
+        ) == {"UserName": "bob"}
+        environment = run.call_args.kwargs["env"]
+        assert environment["AWS_ACCESS_KEY_ID"] == "AKIANEW"
+        assert "AWS_SESSION_TOKEN" not in environment
 
 
 class TestDeleteAccessKey:

@@ -4,7 +4,10 @@ import json
 
 import pytest
 
-from aws_credential_manager.integrations.onepassword import OnePasswordClient
+from aws_credential_manager.integrations.onepassword import (
+    OnePasswordClient,
+    OnePasswordError,
+)
 from tests.conftest import FakeCompletedProcess
 
 MODULE = "aws_credential_manager.integrations.onepassword.subprocess"
@@ -74,8 +77,60 @@ class TestGetItem:
         assert "--vault" in args and "TestVault" in args
 
     def test_not_found_returns_none(self, client, mocker):
-        mocker.patch(MODULE).run.return_value = FakeCompletedProcess(returncode=1)
+        mocker.patch(MODULE).run.return_value = FakeCompletedProcess(
+            returncode=1,
+            stderr='[ERROR] 2026/08/07 "missing" isn\'t an item. '
+                   "Specify the item with its UUID, name, or domain.",
+        )
         assert client.get_item("missing") is None
+
+    def test_dropped_session_raises_instead_of_reporting_not_found(
+        self, client, mocker
+    ):
+        """A lost session must not be reported as a missing item."""
+        mocker.patch(MODULE).run.return_value = FakeCompletedProcess(
+            returncode=1,
+            stderr="[ERROR] 2026/08/07 error initializing client: "
+                   "You are not currently signed in. "
+                   "Please run `op signin --help` for instructions",
+        )
+        with pytest.raises(OnePasswordError) as excinfo:
+            client.get_item("AWS DECA Studio Prod")
+        assert "not currently signed in" in str(excinfo.value)
+        assert "AWS DECA Studio Prod" in str(excinfo.value)
+
+    def test_unknown_vault_raises(self, client, mocker):
+        mocker.patch(MODULE).run.return_value = FakeCompletedProcess(
+            returncode=1,
+            stderr='[ERROR] "AWS" isn\'t a vault in this account.',
+        )
+        with pytest.raises(OnePasswordError):
+            client.get_item("some-item")
+
+
+class TestGetOneTimePassword:
+    def test_returns_primary_otp_without_revealing_the_seed(self, client, mocker):
+        run = mocker.patch(MODULE).run
+        run.return_value = FakeCompletedProcess(returncode=0, stdout="123456\n")
+
+        assert client.get_one_time_password("my-item") == "123456"
+        args = run.call_args.args[0]
+        assert args[:4] == ["op", "item", "get", "my-item"]
+        assert "--otp" in args
+        assert "--reveal" not in args
+
+    def test_raises_when_the_item_has_no_otp_or_op_fails(self, client, mocker):
+        mocker.patch(MODULE).run.return_value = FakeCompletedProcess(
+            returncode=1, stderr="item has no one-time password"
+        )
+
+        with pytest.raises(OnePasswordError, match="OTP lookup failed"):
+            client.get_one_time_password("my-item")
+
+    def test_empty_stderr_raises_rather_than_assuming_not_found(self, client, mocker):
+        mocker.patch(MODULE).run.return_value = FakeCompletedProcess(returncode=1)
+        with pytest.raises(OnePasswordError):
+            client.get_item("some-item")
 
 
 class TestEditItem:

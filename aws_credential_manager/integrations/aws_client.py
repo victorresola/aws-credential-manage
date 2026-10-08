@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+import os
 import subprocess
 import time
 from typing import cast
@@ -10,6 +11,31 @@ from typing import cast
 
 class AWSClient:
     """Thin wrapper around AWS CLI IAM commands."""
+
+    @staticmethod
+    def _credentials_environment(credentials: dict[str, str]) -> dict[str, str]:
+        """Return an environment that authenticates only with ``credentials``.
+
+        Removing inherited AWS credential variables is important when checking a
+        newly-created permanent key: an MFA session must not make that check
+        succeed on the new key's behalf.
+        """
+        environment = os.environ.copy()
+        for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "AWS_PROFILE",
+        ):
+            environment.pop(name, None)
+        environment.update({
+            "AWS_ACCESS_KEY_ID": credentials["AccessKeyId"],
+            "AWS_SECRET_ACCESS_KEY": credentials["SecretAccessKey"],
+        })
+        if credentials.get("SessionToken"):
+            environment["AWS_SESSION_TOKEN"] = credentials["SessionToken"]
+        return environment
 
     def get_user(self, profile_name: str) -> dict:
         """Get IAM user info for a profile."""
@@ -20,14 +46,18 @@ class AWSClient:
         ], capture_output=True, text=True, check=True)
         return cast(dict, json.loads(result.stdout)['User'])
 
-    def update_login_profile(self, profile_name: str, username: str, password: str) -> None:
-        """Update AWS console password."""
+    def change_password(self, profile_name: str, old_password: str, new_password: str) -> None:
+        """Change the calling IAM user's console password.
+
+        Passwords are attached with '=' rather than passed as separate
+        arguments. Either password may begin with '-', which the AWS CLI
+        argument parser would otherwise read as another option and reject.
+        """
         subprocess.run([
-            'aws', 'iam', 'update-login-profile',
+            'aws', 'iam', 'change-password',
             '--profile', profile_name,
-            '--user-name', username,
-            '--password', password,
-            '--no-password-reset-required'
+            f'--old-password={old_password}',
+            f'--new-password={new_password}',
         ], check=True, capture_output=True)
 
     def list_access_keys(self, profile_name: str, username: str) -> list[dict]:
@@ -40,24 +70,69 @@ class AWSClient:
         ], capture_output=True, text=True, check=True)
         return cast(list[dict], json.loads(result.stdout)['AccessKeyMetadata'])
 
-    def create_access_key(self, profile_name: str, username: str) -> dict:
-        """Create a new access key. Returns the AccessKey dict."""
+    def get_mfa_session(
+        self, profile_name: str, mfa_serial_number: str, mfa_code: str
+    ) -> dict[str, str]:
+        """Exchange an MFA code for a temporary session for IAM mutations."""
         result = subprocess.run([
-            'aws', 'iam', 'create-access-key',
+            'aws', 'sts', 'get-session-token',
+            '--profile', profile_name,
+            '--serial-number', mfa_serial_number,
+            '--token-code', mfa_code,
+            '--duration-seconds', '3600',
+            '--output', 'json',
+        ], capture_output=True, text=True, check=True)
+        return cast(dict[str, str], json.loads(result.stdout)['Credentials'])
+
+    def get_mfa_serial_number(self, profile_name: str, username: str) -> str:
+        """Return the sole MFA device ARN configured for an IAM user."""
+        result = subprocess.run([
+            'aws', 'iam', 'list-mfa-devices',
             '--profile', profile_name,
             '--user-name', username,
-            '--output', 'json'
+            '--output', 'json',
         ], capture_output=True, text=True, check=True)
+        devices = json.loads(result.stdout)['MFADevices']
+        if len(devices) != 1:
+            raise ValueError(
+                f"Expected exactly one MFA device for {username}; found {len(devices)}"
+            )
+        return cast(str, devices[0]['SerialNumber'])
+
+    def create_access_key(
+        self, profile_name: str, username: str,
+        session_credentials: dict[str, str] | None = None,
+    ) -> dict:
+        """Create a new access key. Returns the AccessKey dict."""
+        command = ['aws', 'iam', 'create-access-key']
+        if not session_credentials:
+            command.extend(['--profile', profile_name])
+        command.extend(['--user-name', username, '--output', 'json'])
+        result = subprocess.run(command, capture_output=True, text=True, check=True,
+            env=(self._credentials_environment(session_credentials)
+                 if session_credentials else None))
         return cast(dict, json.loads(result.stdout)['AccessKey'])
 
-    def delete_access_key(self, profile_name: str, username: str, access_key_id: str) -> None:
+    def delete_access_key(
+        self, profile_name: str, username: str, access_key_id: str,
+        session_credentials: dict[str, str] | None = None,
+    ) -> None:
         """Delete an access key."""
-        subprocess.run([
-            'aws', 'iam', 'delete-access-key',
-            '--profile', profile_name,
-            '--user-name', username,
-            '--access-key-id', access_key_id
-        ], capture_output=True, text=True, check=True)
+        command = ['aws', 'iam', 'delete-access-key']
+        if not session_credentials:
+            command.extend(['--profile', profile_name])
+        command.extend(['--user-name', username, '--access-key-id', access_key_id])
+        subprocess.run(command, capture_output=True, text=True, check=True,
+            env=(self._credentials_environment(session_credentials)
+                 if session_credentials else None))
+
+    def get_user_with_credentials(self, credentials: dict[str, str]) -> dict:
+        """Get the caller using explicit credentials, without any profile."""
+        result = subprocess.run([
+            'aws', 'iam', 'get-user', '--output', 'json',
+        ], capture_output=True, text=True, check=True,
+            env=self._credentials_environment(credentials))
+        return cast(dict, json.loads(result.stdout)['User'])
 
     def get_password_last_changed(self, profile_name: str) -> str | None:
         """Return ISO timestamp of when the IAM user's console password was last changed.
